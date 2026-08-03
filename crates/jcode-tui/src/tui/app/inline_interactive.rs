@@ -106,6 +106,7 @@ fn filter_routes_by_provider_allowlist(
     current_model: &str,
 ) -> Vec<crate::provider::ModelRoute> {
     use crate::provider::normalize_model_route_provider_label as normalize;
+    use std::collections::HashSet;
 
     let Some(allowlist) = allowlist else {
         return routes;
@@ -118,6 +119,32 @@ fn filter_routes_by_provider_allowlist(
     if allowed.is_empty() {
         return routes;
     }
+
+    // A whitelist entry naming a configured `[providers.<entry>]` profile must
+    // show every model declared under that profile, independent of the route's
+    // `provider` label. Namespaced ids (`cline-pass/kimi-k3`, `openai/gpt-5.6-terra`)
+    // get re-attributed to "openrouter" by `provider_for_model` and by the remote
+    // names-only fallback synthesis, which otherwise drops them from the profile
+    // whitelist (issue #749). Declared membership is the same source of truth used
+    // by `named_provider_profile_routes`.
+    let whitelisted_profile_model_ids: HashSet<String> = {
+        let providers = &crate::config::config().providers;
+        allowlist
+            .iter()
+            .filter_map(|entry| providers.get(entry.trim()))
+            .flat_map(|profile| {
+                profile
+                    .models
+                    .iter()
+                    .map(|m| m.id.trim().to_string())
+                    .chain(profile.default_model.iter().filter_map(|m| {
+                        let m = m.trim();
+                        (!m.is_empty()).then(|| m.to_string())
+                    }))
+            })
+            .filter(|id| !id.is_empty())
+            .collect()
+    };
 
     let route_matches = |route: &crate::provider::ModelRoute| -> bool {
         let provider = normalize(&route.provider);
@@ -134,7 +161,7 @@ fn filter_routes_by_provider_allowlist(
                 || *entry == api_method
                 || (!profile_id.is_empty() && *entry == profile_id)
                 || crate::provider::model_route_provider_labels_match(&route.provider, entry)
-        })
+        }) || whitelisted_profile_model_ids.contains(route.model.trim())
     };
 
     let filtered: Vec<crate::provider::ModelRoute> = routes

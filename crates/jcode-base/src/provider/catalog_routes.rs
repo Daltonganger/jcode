@@ -838,6 +838,30 @@ fn log_model_routes_summary(
     );
 }
 
+/// If `model` is a model id declared under a `[providers.<name>]` profile
+/// (static `[[providers.<name>.models]]` or `default_model`), return that
+/// profile so callers attribute the route to the profile rather than to the
+/// OpenRouter namespace implied by the id's `vendor/` prefix.
+fn named_profile_for_declared_model(
+    model: &str,
+) -> Option<(&String, &crate::config::NamedProviderConfig)> {
+    let target = model.trim();
+    crate::config::config()
+        .providers
+        .iter()
+        .find(|(_, profile)| {
+            profile
+                .models
+                .iter()
+                .any(|m| m.id.trim() == target)
+                || profile
+                    .default_model
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|m| m == target)
+        })
+}
+
 pub fn remote_model_routes_fallback(
     remote_provider_name: Option<&str>,
     remote_available_entries: &[String],
@@ -883,6 +907,29 @@ pub fn remote_model_routes_fallback(
                     String::new()
                 } else {
                     "no Bedrock credentials or region; run /login bedrock".to_string()
+                },
+                cheapness: None,
+            });
+            continue;
+        }
+
+// A namespaced id normally means an OpenRouter model, but when it is a
+        // model the user declared under `[providers.<name>]`, attribute it to
+        // that profile so the picker and `model_picker_providers` whitelist see
+        // the profile's own route (issue #749). Mirrors the identity
+        // `named_provider_profile_routes` produces for the local build path.
+        if let Some((profile_name, profile_config)) =
+            named_profile_for_declared_model(model)
+        {
+            routes.push(ModelRoute {
+                model: model.clone(),
+                provider: profile_name.clone(),
+                api_method: format!("openai-compatible:{}", profile_name),
+                available: true,
+                detail: if profile_config.base_url.trim().is_empty() {
+                    "configured provider profile".to_string()
+                } else {
+                    profile_config.base_url.trim().to_string()
                 },
                 cheapness: None,
             });
