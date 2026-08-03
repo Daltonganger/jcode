@@ -120,59 +120,129 @@ fn filter_routes_by_provider_allowlist(
         return routes;
     }
 
-    // A whitelist entry naming a configured `[providers.<entry>]` profile must
-    // show every model declared under that profile, independent of the route's
-    // `provider` label. Namespaced ids (`cline-pass/kimi-k3`, `openai/gpt-5.6-terra`)
-    // get re-attributed to "openrouter" by `provider_for_model` and by the remote
-    // names-only fallback synthesis, which otherwise drops them from the profile
-    // whitelist (issue #749). Declared membership is the same source of truth used
-    // by `named_provider_profile_routes`.
-    let whitelisted_profile_model_ids: HashSet<String> = {
-        let providers = &crate::config::config().providers;
-        allowlist
-            .iter()
-            .filter_map(|entry| providers.get(entry.trim()))
-            .flat_map(|profile| {
-                profile
-                    .models
-                    .iter()
-                    .map(|m| m.id.trim().to_string())
-                    .chain(profile.default_model.iter().filter_map(|m| {
-                        let m = m.trim();
-                        (!m.is_empty()).then(|| m.to_string())
-                    }))
-            })
-            .filter(|id| !id.is_empty())
-            .collect()
-    };
+    let providers = &crate::config::config().providers;
 
-    let route_matches = |route: &crate::provider::ModelRoute| -> bool {
-        let provider = normalize(&route.provider);
-        let api_method = normalize(&route.api_method);
-        // "openai-compatible:myprofile" normalizes to "openaicompatible:myprofile";
-        // also expose the bare profile id for convenience.
-        let profile_id = route
-            .api_method
-            .split_once(':')
-            .map(|(_, profile)| normalize(profile))
-            .unwrap_or_default();
-        allowed.iter().any(|entry| {
-            *entry == provider
-                || *entry == api_method
-                || (!profile_id.is_empty() && *entry == profile_id)
-                || crate::provider::model_route_provider_labels_match(&route.provider, entry)
-        }) || whitelisted_profile_model_ids.contains(route.model.trim())
-    };
-
-    let filtered: Vec<crate::provider::ModelRoute> = routes
+    // Whitelist entries that name a configured `[providers.<entry>]` profile are
+    // treated authoritatively: the picker shows EXACTLY the models declared under
+    // that profile (`[[providers.<entry>.models]]` + `default_model`), regardless
+    // of whether the remote/live catalog exposes them. A server `available_models`
+    // list that contains only a subset can no longer hide user-declared models,
+    // and a namespaced id (`cline-pass/kimi-k3`) can no longer be re-attributed to
+    // "openrouter" and dropped, because the declared config is the single source
+    // of truth once the user has pinned a profile via `model_picker_providers`
+    // (issue #749). Mirrors the identity `named_provider_profile_routes` builds
+    // for the local multi-provider path.
+    let profile_entries: Vec<String> = allowlist
         .iter()
-        .filter(|route| route.model == current_model || route_matches(route))
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty() && providers.get(entry.as_str()).is_some())
+        .collect();
+    let profile_entry_keys: HashSet<String> = profile_entries
+        .iter()
+        .map(|entry| normalize(entry.as_str()))
+        .collect();
+    // Non-profile allowlist entries (built-in provider ids like "openrouter")
+    // keep their existing catalog-matching behavior.
+    let non_profile_entries: Vec<String> = allowed
+        .iter()
+        .filter(|entry| !profile_entry_keys.contains(*entry))
         .cloned()
         .collect();
-    if filtered.is_empty() {
+
+    let route_matches_entries =
+        |route: &crate::provider::ModelRoute, entries: &[String]| -> bool {
+            let provider = normalize(&route.provider);
+            let api_method = normalize(&route.api_method);
+            // "openai-compatible:myprofile" normalizes to "openaicompatible:myprofile";
+            // also expose the bare profile id for convenience.
+            let profile_id = route
+                .api_method
+                .split_once(':')
+                .map(|(_, profile)| normalize(profile))
+                .unwrap_or_default();
+            entries.iter().any(|entry| {
+                *entry == provider
+                    || *entry == api_method
+                    || (!profile_id.is_empty() && *entry == profile_id)
+                    || crate::provider::model_route_provider_labels_match(&route.provider, entry)
+            })
+        };
+
+    let mut result: Vec<crate::provider::ModelRoute> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    // (1) Every model declared under a whitelisted profile, each with a stable
+    //     profile route identity. Synthesized from config so completeness does
+    //     not depend on the remote catalog having listed the model.
+    for profile_name in &profile_entries {
+        let Some(profile) = providers.get(profile_name.as_str()) else {
+            continue;
+        };
+        let api_method = format!("openai-compatible:{}", profile_name);
+        let detail = if profile.base_url.trim().is_empty() {
+            "configured provider profile".to_string()
+        } else {
+            profile.base_url.trim().to_string()
+        };
+        let mut declared: Vec<String> = profile
+            .models
+            .iter()
+            .filter(|m| m.input.is_empty() || m.input.iter().any(|input| input == "text"))
+            .map(|m| m.id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect();
+        if declared.is_empty()
+            && let Some(default_model) = profile
+                .default_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+        {
+            declared.push(default_model.to_string());
+        }
+        for model in declared {
+            if !seen.insert(model.clone()) {
+                continue;
+            }
+            result.push(crate::provider::ModelRoute {
+                model,
+                provider: profile_name.to_string(),
+                api_method: api_method.clone(),
+                available: true,
+                detail: detail.clone(),
+                cheapness: None,
+            });
+        }
+    }
+
+    // (2) Non-profile allowlist entries: keep matching input routes not already
+    //     added above. Profile entries are intentionally excluded here so a
+    //     profile's live catalog cannot flood the picker beyond its declared
+    //     models — the "nothing else" half of the contract.
+    if !non_profile_entries.is_empty() {
+        for route in &routes {
+            if seen.contains(route.model.trim()) {
+                continue;
+            }
+            if route_matches_entries(route, &non_profile_entries) {
+                seen.insert(route.model.trim().to_string());
+                result.push(route.clone());
+            }
+        }
+    }
+
+    // (3) The active model's route always stays visible so the current
+    //     selection never disappears from the picker.
+    if !seen.contains(current_model.trim())
+        && let Some(route) = routes.iter().find(|r| r.model == current_model)
+    {
+        result.push(route.clone());
+    }
+
+    if result.is_empty() {
         routes
     } else {
-        filtered
+        result
     }
 }
 
